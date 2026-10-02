@@ -1,0 +1,30 @@
+# Python virtual environment — huge, machine-specific, never belongs in Git.
+# Vercel installs fresh dependencies from requirements.txt on its own.
+venv/
+__pycache__/
+*.pyc
+
+# Local-only state files (zone_state.json, reversion_state.json) — once
+# STATE_BACKEND is set to "google_sheets", these aren't used at all on
+# Vercel. Keeping them out of Git either way, since they're just a
+# snapshot of your local machine's testing state, not something that
+# needs to be version-controlled or shared.
+zone_state.json
+reversion_state.json
+zone_state_HARNESS_TEST.json
+reversion_state_HARNESS_TEST.json
+
+# Generated output files — these get created fresh each time you run
+# the historical check / simulator; no reason to commit them.
+fred_historical_trades.csv
+fred_equity_curve.csv
+
+# Common editor/OS clutter
+.DS_Store
+.vscode/
+.idea/
+
+# Environment variable files, if you ever create one for local testing
+# with python-dotenv -- never commit real secrets in any form.
+.env
+.env.local

@@ -1,0 +1,122 @@
+{
+  "BTCUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  },
+  "ETHUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  },
+  "LTCUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  },
+  "XRPUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  },
+  "DOGEUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  },
+  "ADAUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  },
+  "SOLUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  },
+  "AVAXUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  },
+  "BNBUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  },
+  "UNIUSDT": {
+    "waitingBear": false,
+    "exhBearLow": null,
+    "exhBearHigh": null,
+    "exhBearWickPct": null,
+    "exhBearDistATR": null,
+    "waitingBull": false,
+    "exhBullHigh": null,
+    "exhBullLow": null,
+    "exhBullWickPct": null,
+    "exhBullDistATR": null
+  }
+}
