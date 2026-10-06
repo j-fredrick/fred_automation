@@ -42,13 +42,13 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "Html5$css")
 # serverless invocation gets a blank filesystem). Switch this to
 # "google_sheets" before deploying, once FRED_State_Storage_AppsScript.gs
 # is deployed and the two values below are filled in.
-STATE_BACKEND = "local"  # or "google_sheets"
+STATE_BACKEND = os.environ.get("STATE_BACKEND", "local")  # or "google_sheets"
 
 # A NEW, SEPARATE Apps Script Web App from your existing journal one --
 # see FRED_State_Storage_AppsScript.gs's own setup instructions for how
 # to deploy it and get these two values.
 GOOGLE_STATE_SCRIPT_URL = os.environ.get("GOOGLE_STATE_SCRIPT_URL", "https://script.google.com/macros/s/AKfycbx3flHI93v8p20JseeZeIWO2k0V982dpS_L4dR2J-82xP3ji_-BAgy6rILUANJIbUk/exec")
-GOOGLE_STATE_SCRIPT_SECRET = os.environ.get("GOOGLE_STATE_SCRIPT_SECRET", "Html5$css")  # must match STATE_SECRET in the .gs file
+GOOGLE_STATE_SCRIPT_SECRET = os.environ.get("GOOGLE_STATE_SCRIPT_SECRET", "CHANGE_THIS_TO_YOUR_OWN_SECRET")  # must match STATE_SECRET in the .gs file
 
 # ── EMAIL-TO-WEBHOOK BRIDGE (free-plan workaround, no ngrok needed) ──
 # TradingView's free plan can't send webhooks directly, so alerts are sent
@@ -125,7 +125,6 @@ ALLOWED_PAIRS = [
 # behavior if "grade" is ever missing.
 PAIR_GRADE_FILTERS = {
     "ETHUSDT": {"A+", "A"},
-    "SOLUSDT": {"A+", "A"},
 }
 
 # ── CONDITIONAL TIERS ──
