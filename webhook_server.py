@@ -127,7 +127,30 @@ def place_market_order(symbol, side, quantity):
     })
 
 
-def place_protective_orders(symbol, side, quantity, stop_price, target_price):
+def get_atr(symbol, period=14):
+    """Recent 1H ATR, used to size the trailing-stop callback rate."""
+    klines = requests.get(
+        f"{config.BINANCE_DEMO_BASE_URL}/fapi/v1/klines",
+        params={"symbol": symbol, "interval": "1h", "limit": period + 1}
+    ).json()
+    true_ranges = []
+    for i in range(1, len(klines)):
+        high = float(klines[i][2])
+        low = float(klines[i][3])
+        prev_close = float(klines[i - 1][4])
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
+
+
+def calc_callback_rate(symbol, entry):
+    """1.5x ATR (config.TRAIL_ATR_MULTIPLIER) as a % of price, rounded to Binance's
+    0.1 step and clamped to its 0.1-10 allowed range."""
+    atr = get_atr(symbol, config.ATR_PERIOD)
+    rate = (atr * config.TRAIL_ATR_MULTIPLIER) / entry * 100
+    return min(10.0, max(0.1, round(rate, 1)))
+
+
+def place_protective_orders(symbol, side, quantity, stop_price, target_price, strategy=None, entry=None):
     """
     IMPORTANT: As of Dec 9, 2025, Binance requires all conditional orders
     (STOP_MARKET, TAKE_PROFIT_MARKET, etc.) to go through the separate
@@ -135,6 +158,18 @@ def place_protective_orders(symbol, side, quantity, stop_price, target_price):
     endpoint. Using the old endpoint now returns error -4120. The two
     key differences: an "algoType": "CONDITIONAL" field is required, and
     the trigger price parameter is called "triggerPrice", not "stopPrice".
+
+    Exit style depends on the strategy:
+      - Zone / Momentum (config.TRAILING_ELIGIBLE_STRATEGIES): no fixed
+        take-profit. A TRAILING_STOP_MARKET order is placed that stays
+        dormant until price reaches the 3:1 level (target_price), then
+        trails by callbackRate % behind price.
+      - Everything else (Mean Reversion): fixed TAKE_PROFIT_MARKET.
+    If the trailing order is rejected, falls back to a fixed take-profit so
+    the trade is never left without a target.
+
+    Returns (stop_order, target_order, mode, callback_rate) where mode is
+    "trailing" or "fixed".
     """
     opposite_side = "SELL" if side == "BUY" else "BUY"
 
@@ -148,17 +183,45 @@ def place_protective_orders(symbol, side, quantity, stop_price, target_price):
         "reduceOnly": "true",
     })
 
-    target_order = binance_post("/fapi/v1/algoOrder", {
-        "algoType": "CONDITIONAL",
-        "symbol": symbol,
-        "side": opposite_side,
-        "type": "TAKE_PROFIT_MARKET",
-        "quantity": quantity,
-        "triggerPrice": target_price,
-        "reduceOnly": "true",
-    })
+    mode = "fixed"
+    callback_rate = None
+    target_order = None
 
-    return stop_order, target_order
+    if strategy in config.TRAILING_ELIGIBLE_STRATEGIES:
+        try:
+            callback_rate = calc_callback_rate(symbol, entry if entry else target_price)
+            target_order = binance_post("/fapi/v1/algoOrder", {
+                "algoType": "CONDITIONAL",
+                "symbol": symbol,
+                "side": opposite_side,
+                "type": "TRAILING_STOP_MARKET",
+                "quantity": quantity,
+                "activatePrice": target_price,
+                "callbackRate": callback_rate,
+                "reduceOnly": "true",
+            })
+            if "algoId" in target_order:
+                mode = "trailing"
+            else:
+                print(f"[WARNING] Trailing order rejected for {symbol}: {target_order} -- falling back to fixed take-profit")
+                target_order = None
+        except Exception as e:
+            print(f"[WARNING] Trailing order failed for {symbol}: {e} -- falling back to fixed take-profit")
+            target_order = None
+
+    if target_order is None:
+        target_order = binance_post("/fapi/v1/algoOrder", {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": opposite_side,
+            "type": "TAKE_PROFIT_MARKET",
+            "quantity": quantity,
+            "triggerPrice": target_price,
+            "reduceOnly": "true",
+        })
+        mode = "fixed"
+
+    return stop_order, target_order, mode, callback_rate
 
 
 # ─────────────────────────────
@@ -404,7 +467,15 @@ def webhook():
         return jsonify({"status": "error", "detail": entry_order}), 500
 
     # ── Place protective stop-loss and take-profit ──
-    stop_order, target_order = place_protective_orders(symbol, side, quantity, stop, target)
+    stop_order, target_order, exit_mode, callback_rate = place_protective_orders(
+        symbol, side, quantity, stop, target, strategy=strategy, entry=entry)
+
+    if "algoId" not in stop_order:
+        send_telegram_message(f"🚨 STOP-LOSS order FAILED for {symbol} — position is UNPROTECTED. Detail: {stop_order}")
+    if "algoId" not in target_order:
+        send_telegram_message(f"⚠️ Exit order (target/trailing) FAILED for {symbol}. Detail: {target_order}")
+    if strategy in config.TRAILING_ELIGIBLE_STRATEGIES and exit_mode == "fixed":
+        send_telegram_message(f"⚠️ {symbol}: trailing order was rejected, used a fixed take-profit instead.")
 
     # ── Telegram confirmation ──
     risk_reward = round(abs(target - entry) / per_unit_risk, 2)
@@ -415,7 +486,8 @@ def webhook():
         f"Strategy: {strategy}\n"
         f"Entry: {entry}\n"
         f"Stop: {stop}\n"
-        f"Target: {target}\n"
+        f"{'Trail activates at' if exit_mode == 'trailing' else 'Target'}: {target}\n"
+        + (f"Trail distance: {callback_rate}%\n" if exit_mode == "trailing" else "") +
         f"R:R: {risk_reward}:1\n"
         f"Risk: ${risk_amount}\n"
         f"Size: {quantity}"
@@ -486,6 +558,28 @@ def run_checks():
     try:
         with contextlib.redirect_stdout(output_buffer):
             fred_detectors.run_all_pairs_live()
+        return jsonify({"status": "success", "log": output_buffer.getvalue()}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e), "log": output_buffer.getvalue()}), 500
+
+
+# ─────────────────────────────
+# Trade monitor trigger — pinged by its own cron-job.org job every 5-15
+# minutes. Handles the 48hr time stop and detects trades that have closed
+# (stop / trailing / target / manual) so the journal gets the real result.
+# Light enough to finish well inside cron-job.org's 30s limit.
+# ─────────────────────────────
+
+@app.route("/manage-trades", methods=["GET", "POST"])
+def manage_trades():
+    import trade_monitor
+    import io
+    import contextlib
+
+    output_buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output_buffer):
+            trade_monitor.run_monitor_cycle()
         return jsonify({"status": "success", "log": output_buffer.getvalue()}), 200
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e), "log": output_buffer.getvalue()}), 500

@@ -1,22 +1,23 @@
 """
 trade_monitor.py
 -----------------
-Runs continuously in the background, checking every open trade every few
-minutes to handle three jobs:
+Checks every open trade and handles two jobs:
 
   1. TIME STOP — if a trade has been open longer than MAX_HOLD_HOURS,
-     close it at market price.
-  2. TRAILING STOP — for Strong Candle Zone / Momentum Continuation trades
-     only: once price reaches the original 3:1 target, lock in that profit
-     and start trailing the stop behind price using ATR distance, instead
-     of closing at the fixed target.
-  3. EXIT DETECTION — if a trade has closed (stop or target filled) since
-     the last check, fill in the journal's exit columns and stop tracking it.
+     close it at market price and cancel its leftover protective orders.
+  2. EXIT DETECTION — if a trade has closed (stop, trailing stop, target,
+     or a manual close) since the last check, read the REAL fills from
+     Binance, write the true exit price / result / R to the journal,
+     cancel any leftover protective orders, and stop tracking it.
 
-Run this locally with: python trade_monitor.py
-It will loop forever, checking every MONITOR_INTERVAL_SECONDS, until you
-stop it with Ctrl+C. Later, this becomes a scheduled Vercel function
-instead of an infinite loop.
+Trailing stops are NOT handled here anymore. For Zone / Momentum trades the
+webhook places a native Binance TRAILING_STOP_MARKET order that activates at
+the 3:1 level, so Binance does the trailing itself.
+
+Runs as a scheduled call to /manage-trades in webhook_server.py (cron-job.org
+every 5-15 minutes). For local testing you can still run:
+    python trade_monitor.py
+which loops every MONITOR_INTERVAL_SECONDS until Ctrl+C.
 """
 
 import time
@@ -24,6 +25,14 @@ import hmac
 import hashlib
 import requests
 import config
+
+# An exit price within this fraction of the original stop/target is treated
+# as having hit that level (covers normal slippage).
+EXIT_MATCH_TOLERANCE = 0.003  # 0.3%
+
+# Fills are searched from slightly BEFORE the recorded entry time, because the
+# journal's entryTime is stamped after the entry order was already filled.
+FILL_LOOKBACK_SECONDS = 120
 
 
 # ─────────────────────────────
@@ -44,7 +53,7 @@ def binance_get(endpoint, params=None):
     params["timestamp"] = int(time.time() * 1000)
     params["signature"] = sign_request(params)
     headers = {"X-MBX-APIKEY": config.BINANCE_API_KEY}
-    response = requests.get(config.BINANCE_DEMO_BASE_URL + endpoint, headers=headers, params=params)
+    response = requests.get(config.BINANCE_DEMO_BASE_URL + endpoint, headers=headers, params=params, timeout=15)
     return response.json()
 
 
@@ -53,7 +62,7 @@ def binance_post(endpoint, params=None):
     params["timestamp"] = int(time.time() * 1000)
     params["signature"] = sign_request(params)
     headers = {"X-MBX-APIKEY": config.BINANCE_API_KEY}
-    response = requests.post(config.BINANCE_DEMO_BASE_URL + endpoint, headers=headers, params=params)
+    response = requests.post(config.BINANCE_DEMO_BASE_URL + endpoint, headers=headers, params=params, timeout=15)
     return response.json()
 
 
@@ -62,56 +71,47 @@ def binance_delete(endpoint, params=None):
     params["timestamp"] = int(time.time() * 1000)
     params["signature"] = sign_request(params)
     headers = {"X-MBX-APIKEY": config.BINANCE_API_KEY}
-    response = requests.delete(config.BINANCE_DEMO_BASE_URL + endpoint, headers=headers, params=params)
+    response = requests.delete(config.BINANCE_DEMO_BASE_URL + endpoint, headers=headers, params=params, timeout=15)
     return response.json()
 
 
 def get_current_price(symbol):
-    response = requests.get(f"{config.BINANCE_DEMO_BASE_URL}/fapi/v1/ticker/price", params={"symbol": symbol})
+    response = requests.get(f"{config.BINANCE_DEMO_BASE_URL}/fapi/v1/ticker/price",
+                            params={"symbol": symbol}, timeout=15)
     return float(response.json()["price"])
 
 
 def get_position_amount(symbol):
+    """
+    Returns the open position size, or None if Binance's answer couldn't be
+    read. None must NEVER be treated as "position closed" — that would
+    wrongly close out a live trade in the journal on a temporary API error.
+    """
     positions = binance_get("/fapi/v2/positionRisk", {"symbol": symbol})
     if not isinstance(positions, list) or not positions:
-        return 0.0
+        print(f"[WARNING] Could not read position for {symbol}: {positions}")
+        return None
     return float(positions[0]["positionAmt"])
 
 
-def get_atr(symbol, period=14):
-    """Fetches recent 1H candles and calculates ATR — used for trailing distance."""
-    klines = requests.get(
-        f"{config.BINANCE_DEMO_BASE_URL}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": "1h", "limit": period + 1}
-    ).json()
-
-    true_ranges = []
-    for i in range(1, len(klines)):
-        high = float(klines[i][2])
-        low = float(klines[i][3])
-        prev_close = float(klines[i - 1][4])
-        true_range = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        true_ranges.append(true_range)
-
-    return sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
+def get_trade_fills(symbol, since_ms):
+    """Returns a list of fills since since_ms, or None if the request failed."""
+    fills = binance_get("/fapi/v1/userTrades", {"symbol": symbol, "startTime": since_ms, "limit": 1000})
+    if not isinstance(fills, list):
+        print(f"[WARNING] Could not fetch fills for {symbol}: {fills}")
+        return None
+    return fills
 
 
 def cancel_algo_order(symbol, algo_id):
-    return binance_delete("/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
-
-
-def place_stop_algo_order(symbol, side, quantity, stop_price):
-    """side here is the ORIGINAL trade side — this places the opposite-side protective order."""
-    opposite_side = "SELL" if side == "BUY" else "BUY"
-    return binance_post("/fapi/v1/algoOrder", {
-        "algoType": "CONDITIONAL",
-        "symbol": symbol,
-        "side": opposite_side,
-        "type": "STOP_MARKET",
-        "quantity": quantity,
-        "triggerPrice": stop_price,
-        "reduceOnly": "true",
-    })
+    """Best effort — an order that already triggered or expired just returns an error, which is fine."""
+    if not algo_id:
+        return None
+    try:
+        return binance_delete("/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
+    except Exception as e:
+        print(f"[WARNING] Could not cancel algo order {algo_id} on {symbol}: {e}")
+        return None
 
 
 def close_market(symbol, side, quantity):
@@ -137,14 +137,6 @@ def get_open_trades():
     except Exception as e:
         print(f"[WARNING] Failed to fetch open trades: {e}")
         return []
-
-
-def update_open_trade(sheet_row, **kwargs):
-    try:
-        payload = {"secret": config.APPS_SCRIPT_SECRET, "action": "updateOpenTrade", "sheetRow": sheet_row, **kwargs}
-        requests.post(config.APPS_SCRIPT_URL, json=payload, timeout=10)
-    except Exception as e:
-        print(f"[WARNING] Failed to update open trade tracking: {e}")
 
 
 def remove_open_trade(sheet_row):
@@ -182,103 +174,141 @@ def send_telegram_message(text):
 
 
 # ─────────────────────────────
+# Exit accounting from REAL fills
+# ─────────────────────────────
+
+def summarize_fills(trade, fills):
+    """
+    Builds the real entry/exit/PnL picture for a trade from Binance fills.
+    Returns None if the fills don't contain both an opening and a closing side.
+    Result is NET of commissions (what actually hit the account).
+    """
+    side = trade["side"].upper()
+    opening = [f for f in fills if f["side"] == side]
+    closing = [f for f in fills if f["side"] != side]
+    if not opening or not closing:
+        return None
+
+    open_qty = sum(float(f["qty"]) for f in opening)
+    close_qty = sum(float(f["qty"]) for f in closing)
+    if open_qty <= 0 or close_qty <= 0:
+        return None
+
+    avg_entry = sum(float(f["price"]) * float(f["qty"]) for f in opening) / open_qty
+    avg_exit = sum(float(f["price"]) * float(f["qty"]) for f in closing) / close_qty
+    gross = sum(float(f.get("realizedPnl", 0)) for f in closing)
+    fees = sum(float(f.get("commission", 0)) for f in fills if f.get("commissionAsset") == "USDT")
+    net = gross - fees
+
+    risk_per_unit = abs(avg_entry - float(trade["originalStop"]))
+    r_multiple = round(net / (risk_per_unit * close_qty), 2) if risk_per_unit > 0 else 0
+
+    return {"avg_entry": avg_entry, "avg_exit": avg_exit, "net": net, "r": r_multiple}
+
+
+def classify_exit(trade, summary):
+    """Labels how the trade ended, based on where the real exit price landed."""
+    exit_price = summary["avg_exit"]
+    stop = float(trade["originalStop"])
+    target = float(trade["originalTarget"])
+    tol = exit_price * EXIT_MATCH_TOLERANCE
+
+    if abs(exit_price - stop) <= tol:
+        return "Stop Loss"
+
+    if trade["strategy"] in config.TRAILING_ELIGIBLE_STRATEGIES:
+        # These trades have no fixed target; a profitable exit means the trailing stop fired.
+        if summary["net"] > 0:
+            return "Trailing Stop"
+    elif abs(exit_price - target) <= tol:
+        return "Take Profit"
+
+    return "Manual / Other Close"
+
+
+def finish_trade(trade, forced_reason=None):
+    """
+    Cleans up a trade that is no longer open: cancels leftover protective
+    orders, writes the real result to the journal, stops tracking it, and
+    sends a Telegram summary. Returns True if the trade was finalized, False
+    if it should be retried next cycle (Binance fills couldn't be fetched).
+    """
+    symbol = trade["symbol"]
+    entry_time = float(trade["entryTime"])
+    hours_open = (time.time() - entry_time) / 3600
+    sheet_row = trade["_sheetRow"]
+    trade_row_number = trade["tradeRowNumber"]
+
+    since_ms = int((entry_time - FILL_LOOKBACK_SECONDS) * 1000)
+    fills = get_trade_fills(symbol, since_ms)
+    if fills is None:
+        return False  # Binance hiccup — keep tracking and retry next cycle
+
+    # Whatever protective orders are left (the one that didn't trigger) must go,
+    # or they could fire on the next trade for this symbol.
+    cancel_algo_order(symbol, trade.get("stopAlgoId"))
+    cancel_algo_order(symbol, trade.get("targetAlgoId"))
+
+    summary = summarize_fills(trade, fills)
+
+    if summary:
+        reason = forced_reason or classify_exit(trade, summary)
+        net = round(summary["net"], 2)
+        close_trade_in_journal(trade_row_number, reason, hours_open, summary["avg_exit"], reason, net, summary["r"])
+        send_telegram_message(
+            f"📘 {symbol} trade closed ({reason}).\n"
+            f"Exit: {summary['avg_exit']:.6g}\n"
+            f"Result: ${net} ({summary['r']}R)\n"
+            f"Held: {hours_open:.1f}h. Journal updated."
+        )
+        print(f"[CLOSED] {symbol} — {reason} @ {summary['avg_exit']} | ${net} | {summary['r']}R")
+    else:
+        reason = forced_reason or "Closed (fills not found)"
+        close_trade_in_journal(trade_row_number, reason, hours_open, "", reason, "", "")
+        send_telegram_message(
+            f"📘 {symbol} trade closed ({reason}). Could not match fills to fill in the result — "
+            f"please check Binance and the journal row manually."
+        )
+        print(f"[CLOSED] {symbol} — {reason} (no matching fills)")
+
+    remove_open_trade(sheet_row)
+    return True
+
+
+# ─────────────────────────────
 # Main monitoring logic
 # ─────────────────────────────
 
 def check_trade(trade):
     symbol = trade["symbol"]
-    side = trade["side"]
-    quantity = float(trade["quantity"])
+    side = trade["side"].upper()
     entry_time = float(trade["entryTime"])
-    original_stop = float(trade["originalStop"])
-    original_target = float(trade["originalTarget"])
-    strategy = trade["strategy"]
-    trailing_active = str(trade["trailingActive"]).upper() == "TRUE"
-    current_stop_price = float(trade["currentStopPrice"])
-    sheet_row = trade["_sheetRow"]
-    trade_row_number = trade["tradeRowNumber"]
 
     hours_open = (time.time() - entry_time) / 3600
     position_amt = get_position_amount(symbol)
 
-    # ── Case 1: Position already closed (stop or target filled naturally) ──
+    if position_amt is None:
+        return  # Couldn't read the position — do nothing this cycle rather than guess
+
+    # ── Case 1: Position is gone (stop, trailing stop, target, or manual close) ──
     if position_amt == 0:
-        current_price = get_current_price(symbol)
-        # Estimate which side it exited on, based on which is closer to current price
-        hit_stop = abs(current_price - current_stop_price) < abs(current_price - original_target)
-        exit_price = current_stop_price if hit_stop else original_target
-        exit_reason = "Stop Loss" if hit_stop else ("Take Profit" if not trailing_active else "Take Profit")
-        exit_type = exit_reason
-
-        per_unit_risk = abs(original_target - original_stop) / 3  # back out original 1R distance
-        result = (exit_price - float(trade["originalStop"])) * quantity if side == "BUY" else (float(trade["originalStop"]) - exit_price) * quantity
-        r_gained_lost = round(result / (per_unit_risk * quantity), 2) if per_unit_risk > 0 else 0
-
-        close_trade_in_journal(trade_row_number, exit_reason, hours_open, exit_price, exit_type, round(result, 2), r_gained_lost)
-        remove_open_trade(sheet_row)
-        send_telegram_message(f"📘 {symbol} trade closed ({exit_reason}). Journal updated.")
-        print(f"[CLOSED] {symbol} — {exit_reason} @ {exit_price}")
+        finish_trade(trade)
         return
 
-    # ── Case 2: 48-hour time stop ──
+    # ── Case 2: Time stop ──
     if hours_open >= config.MAX_HOLD_HOURS:
-        close_market(symbol, side, quantity)
-        cancel_algo_order(symbol, trade["stopAlgoId"])
-        if not trailing_active:
-            cancel_algo_order(symbol, trade["targetAlgoId"])
-
-        exit_price = get_current_price(symbol)
-        per_unit_risk = abs(original_target - original_stop) / 3
-        result = (exit_price - original_stop) * quantity if side == "BUY" else (original_stop - exit_price) * quantity
-        r_gained_lost = round(result / (per_unit_risk * quantity), 2) if per_unit_risk > 0 else 0
-
-        close_trade_in_journal(trade_row_number, "Time Stop", hours_open, exit_price, "Time Stop", round(result, 2), r_gained_lost)
-        remove_open_trade(sheet_row)
-        send_telegram_message(f"⏰ {symbol} force-closed — 48hr Time Stop reached.")
+        result = close_market(symbol, side, abs(position_amt))
+        if "orderId" not in result:
+            send_telegram_message(f"❌ Time stop FAILED to close {symbol}: {result}")
+            print(f"[ERROR] Time stop close failed for {symbol}: {result}")
+            return
+        time.sleep(2)  # give Binance a moment to record the closing fill
+        finish_trade(trade, forced_reason="Time Stop")
         print(f"[TIME STOP] {symbol} closed after {hours_open:.1f} hours")
         return
 
-    # ── Case 3: Trailing stop logic (Zone Entry / Momentum Continuation only) ──
-    if strategy not in config.TRAILING_ELIGIBLE_STRATEGIES:
-        return
-
-    current_price = get_current_price(symbol)
-    atr = get_atr(symbol, config.ATR_PERIOD)
-    trail_distance = atr * config.TRAIL_ATR_MULTIPLIER
-
-    if not trailing_active:
-        # Has price reached the original fixed target yet?
-        target_reached = (current_price >= original_target) if side == "BUY" else (current_price <= original_target)
-        if not target_reached:
-            return  # Nothing to do yet, still waiting for original target
-
-        # Lock in the original win, cancel fixed orders, start trailing
-        cancel_algo_order(symbol, trade["stopAlgoId"])
-        cancel_algo_order(symbol, trade["targetAlgoId"])
-
-        new_stop_price = original_target  # Lock in the 3:1 profit as the new floor
-        new_stop_order = place_stop_algo_order(symbol, side, quantity, new_stop_price)
-
-        update_open_trade(sheet_row, stopAlgoId=new_stop_order.get("algoId"),
-                           trailingActive="TRUE", currentStopPrice=new_stop_price)
-        send_telegram_message(f"🎯 {symbol} hit original target — now trailing to capture more upside.")
-        print(f"[TRAILING STARTED] {symbol} — stop locked at {new_stop_price}")
-        return
-
-    # Already trailing — check if the stop should move further in our favor
-    if side == "BUY":
-        candidate_stop = current_price - trail_distance
-        should_update = candidate_stop > current_stop_price
-    else:
-        candidate_stop = current_price + trail_distance
-        should_update = candidate_stop < current_stop_price
-
-    if should_update:
-        cancel_algo_order(symbol, trade["stopAlgoId"])
-        new_stop_order = place_stop_algo_order(symbol, side, quantity, round(candidate_stop, 2))
-        update_open_trade(sheet_row, stopAlgoId=new_stop_order.get("algoId"),
-                           currentStopPrice=round(candidate_stop, 2))
-        print(f"[TRAIL UPDATED] {symbol} — new stop {candidate_stop:.2f}")
+    # Otherwise: trade is open and within its hold window. Binance handles the
+    # stop-loss and the trailing / take-profit exit on its own.
 
 
 def run_monitor_cycle():
