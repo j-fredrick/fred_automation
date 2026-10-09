@@ -318,7 +318,9 @@ def run_monitor_cycle():
         return
 
     print(f"Checking {len(trades)} open trade(s)...")
-    for trade in trades:
+    # Work from the bottom of the sheet upward: removing a row shifts every row below it,
+    # so going bottom-up keeps the remaining trades' row numbers correct within one cycle.
+    for trade in sorted(trades, key=lambda t: t["_sheetRow"], reverse=True):
         try:
             check_trade(trade)
         except Exception as e:
