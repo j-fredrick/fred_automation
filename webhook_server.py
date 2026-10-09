@@ -17,6 +17,7 @@ Later, this same logic gets adapted into Vercel's serverless format.
 """
 
 import time
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 import hmac
 import hashlib
 import requests
@@ -79,6 +80,51 @@ def get_current_price(symbol):
     return float(response.json()["price"])
 
 
+_symbol_filters_cache = {}
+
+
+def get_symbol_filters(symbol):
+    """
+    Returns {"tick": Decimal, "step": Decimal, "min_qty": Decimal} for a symbol
+    from Binance's exchange info, or None if it couldn't be fetched. Binance
+    rejects any price/quantity with more decimals than these allow (error
+    -1111, "Precision is over the maximum defined for this asset").
+    """
+    if symbol in _symbol_filters_cache:
+        return _symbol_filters_cache[symbol]
+    try:
+        info = requests.get(f"{config.BINANCE_DEMO_BASE_URL}/fapi/v1/exchangeInfo", timeout=15).json()
+        for sym in info.get("symbols", []):
+            if sym.get("symbol") != symbol:
+                continue
+            by_type = {f["filterType"]: f for f in sym.get("filters", [])}
+            lot = by_type.get("MARKET_LOT_SIZE") or by_type.get("LOT_SIZE")
+            price = by_type.get("PRICE_FILTER")
+            if not lot or not price:
+                return None
+            result = {
+                "tick": Decimal(price["tickSize"]),
+                "step": Decimal(lot["stepSize"]),
+                "min_qty": Decimal(lot["minQty"]),
+            }
+            _symbol_filters_cache[symbol] = result
+            return result
+    except Exception as e:
+        print(f"[WARNING] Could not fetch exchange filters for {symbol}: {e}")
+    return None
+
+
+def round_price(value, tick):
+    """Nearest valid price, as a plain-decimal string (never scientific notation)."""
+    d = (Decimal(str(value)) / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
+    return format(d, "f")
+
+
+def round_quantity(value, step):
+    """Quantity rounded DOWN to the step size (never risks more than intended), as a Decimal."""
+    return (Decimal(str(value)) / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
 def get_open_positions():
     """Returns a list of symbols that currently have a non-zero position."""
     positions = binance_get("/fapi/v2/positionRisk")
@@ -95,6 +141,44 @@ def get_open_positions_detailed():
         print(f"[WARNING] Unexpected response from Binance when fetching positions: {positions}")
         return []
     return [p for p in positions if float(p["positionAmt"]) != 0]
+
+
+def ensure_leverage_and_margin(symbol):
+    """
+    Makes sure the symbol is on the configured leverage and margin mode
+    (config.LEVERAGE / config.MARGIN_MODE) BEFORE a trade opens, fixing it
+    if not (only possible while flat, which is always true here because the
+    existing-position check already passed). Returns (leverage, margin_mode)
+    as Binance actually reports them afterwards, or None if they still don't
+    match -- in which case the caller must not open the trade.
+    """
+    want_lev = int(config.LEVERAGE)
+    want_margin = "CROSSED" if str(config.MARGIN_MODE).upper().startswith("CROSS") else "ISOLATED"
+
+    def read():
+        info = binance_get("/fapi/v2/positionRisk", {"symbol": symbol})
+        if not isinstance(info, list) or not info:
+            return None
+        pos = info[0]
+        margin = "CROSSED" if str(pos.get("marginType", "")).lower().startswith("cross") else "ISOLATED"
+        return int(float(pos.get("leverage", 0))), margin
+
+    current = read()
+    if current is None:
+        return None
+    lev, margin = current
+
+    if margin != want_margin:
+        result = binance_post("/fapi/v1/marginType", {"symbol": symbol, "marginType": want_margin})
+        print(f"[SETUP] {symbol} margin mode {margin} -> {want_margin}: {result}")
+    if lev != want_lev:
+        result = binance_post("/fapi/v1/leverage", {"symbol": symbol, "leverage": want_lev})
+        print(f"[SETUP] {symbol} leverage {lev}x -> {want_lev}x: {result}")
+
+    current = read()
+    if current is None or current != (want_lev, want_margin):
+        return None
+    return current
 
 
 def close_symbol_position(symbol):
@@ -189,7 +273,7 @@ def place_protective_orders(symbol, side, quantity, stop_price, target_price, st
 
     if strategy in config.TRAILING_ELIGIBLE_STRATEGIES:
         try:
-            callback_rate = calc_callback_rate(symbol, entry if entry else target_price)
+            callback_rate = calc_callback_rate(symbol, entry if entry else float(target_price))
             target_order = binance_post("/fapi/v1/algoOrder", {
                 "algoType": "CONDITIONAL",
                 "symbol": symbol,
@@ -459,8 +543,37 @@ def webhook():
               f"capped to {capped_quantity} (${config.MAX_POSITION_NOTIONAL_USD:,.2f} notional)")
         quantity = capped_quantity
 
+    # ── Round quantity / stop / target to what Binance accepts for this symbol ──
+    filters = get_symbol_filters(symbol)
+    if not filters:
+        reason = f"Could not load Binance precision rules for {symbol} — not opening a trade without them"
+        send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
+        return jsonify({"status": "rejected", "reason": reason}), 400
+
+    qty_dec = round_quantity(quantity, filters["step"])
+    if qty_dec < filters["min_qty"] or qty_dec <= 0:
+        reason = f"{symbol} position size {quantity} is below Binance's minimum order size ({filters['min_qty']})"
+        send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
+        return jsonify({"status": "rejected", "reason": reason}), 400
+
+    quantity_str = format(qty_dec, "f")
+    stop_str = round_price(stop, filters["tick"])
+    target_str = round_price(target, filters["tick"])
+    quantity = float(qty_dec)
+    stop = float(stop_str)
+    target = float(target_str)
+
+    # ── Confirm leverage / margin mode match config (auto-fix if not) ──
+    lev_state = ensure_leverage_and_margin(symbol)
+    if not lev_state:
+        reason = (f"{symbol} is not on {config.LEVERAGE}x {config.MARGIN_MODE} and could not be corrected "
+                  f"— not opening a trade at the wrong leverage")
+        send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
+        return jsonify({"status": "rejected", "reason": reason}), 400
+    actual_leverage, actual_margin = lev_state
+
     # ── Place the entry order ──
-    entry_order = place_market_order(symbol, side, quantity)
+    entry_order = place_market_order(symbol, side, quantity_str)
 
     if "orderId" not in entry_order:
         send_telegram_message(f"❌ Order FAILED for {symbol}: {entry_order}")
@@ -468,7 +581,7 @@ def webhook():
 
     # ── Place protective stop-loss and take-profit ──
     stop_order, target_order, exit_mode, callback_rate = place_protective_orders(
-        symbol, side, quantity, stop, target, strategy=strategy, entry=entry)
+        symbol, side, quantity_str, stop_str, target_str, strategy=strategy, entry=entry)
 
     if "algoId" not in stop_order:
         send_telegram_message(f"🚨 STOP-LOSS order FAILED for {symbol} — position is UNPROTECTED. Detail: {stop_order}")
@@ -507,7 +620,9 @@ def webhook():
         "riskAmount": risk_amount,
         "positionSize": quantity,
         "plannedHold": "48Hrs",
-        "leverage": f"{config.LEVERAGE}X",
+        "leverage": f"{actual_leverage}X",
+        "marginMode": actual_margin,
+        "setupGrade": data.get("grade", ""),
         "note": data.get("note", ""),
     })
 
