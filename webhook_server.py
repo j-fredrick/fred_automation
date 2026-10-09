@@ -64,6 +64,26 @@ def binance_post(endpoint, params=None):
     return response.json()
 
 
+def binance_delete(endpoint, params=None):
+    params = params or {}
+    params["timestamp"] = int(time.time() * 1000)
+    params["signature"] = sign_request(params)
+    headers = {"X-MBX-APIKEY": config.BINANCE_API_KEY}
+    response = requests.delete(config.BINANCE_DEMO_BASE_URL + endpoint, headers=headers, params=params)
+    return response.json()
+
+
+def cancel_algo_order(symbol, algo_id):
+    """Best effort cancel of a conditional (algo) order; never raises."""
+    if not algo_id:
+        return None
+    try:
+        return binance_delete("/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
+    except Exception as e:
+        print(f"[WARNING] Could not cancel algo order {algo_id} on {symbol}: {e}")
+        return None
+
+
 def get_usdt_balance():
     balances = binance_get("/fapi/v2/balance")
     if not isinstance(balances, list):
@@ -102,10 +122,13 @@ def get_symbol_filters(symbol):
             price = by_type.get("PRICE_FILTER")
             if not lot or not price:
                 return None
+            min_notional_filter = by_type.get("MIN_NOTIONAL") or {}
             result = {
                 "tick": Decimal(price["tickSize"]),
                 "step": Decimal(lot["stepSize"]),
                 "min_qty": Decimal(lot["minQty"]),
+                # Futures reports this as "notional"; 0 means no minimum was reported.
+                "min_notional": Decimal(str(min_notional_filter.get("notional", 0))),
             }
             _symbol_filters_cache[symbol] = result
             return result
@@ -543,6 +566,17 @@ def webhook():
               f"capped to {capped_quantity} (${config.MAX_POSITION_NOTIONAL_USD:,.2f} notional)")
         quantity = capped_quantity
 
+    # ── Never ask for more margin than the account actually has ──
+    # Without this, a small account sized at 10x would need ~100% of its balance
+    # as margin and Binance would reject the entry once fees are counted.
+    margin_limit = getattr(config, "MARGIN_USAGE_LIMIT", 0.95)
+    max_notional_by_margin = balance * margin_limit * config.LEVERAGE
+    if quantity * entry > max_notional_by_margin:
+        reduced_quantity = max_notional_by_margin / entry
+        print(f"[MARGIN CAP] {symbol}: size {quantity} would need more than {margin_limit:.0%} of the "
+              f"available balance as margin -- reduced to {reduced_quantity}")
+        quantity = reduced_quantity
+
     # ── Round quantity / stop / target to what Binance accepts for this symbol ──
     filters = get_symbol_filters(symbol)
     if not filters:
@@ -556,12 +590,21 @@ def webhook():
         send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
         return jsonify({"status": "rejected", "reason": reason}), 400
 
+    order_value = qty_dec * Decimal(str(entry))
+    if filters["min_notional"] and order_value < filters["min_notional"]:
+        reason = (f"{symbol} order value ${order_value:.2f} is below Binance's minimum of "
+                  f"${filters['min_notional']} for this pair at the current account size — skipped")
+        send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
+        return jsonify({"status": "rejected", "reason": reason}), 400
+
     quantity_str = format(qty_dec, "f")
     stop_str = round_price(stop, filters["tick"])
     target_str = round_price(target, filters["tick"])
     quantity = float(qty_dec)
     stop = float(stop_str)
     target = float(target_str)
+    # Report the risk actually taken after margin cap and rounding, not the intended figure.
+    risk_amount = round(quantity * abs(entry - stop), 2)
 
     # ── Confirm leverage / margin mode match config (auto-fix if not) ──
     lev_state = ensure_leverage_and_margin(symbol)
@@ -584,7 +627,20 @@ def webhook():
         symbol, side, quantity_str, stop_str, target_str, strategy=strategy, entry=entry)
 
     if "algoId" not in stop_order:
-        send_telegram_message(f"🚨 STOP-LOSS order FAILED for {symbol} — position is UNPROTECTED. Detail: {stop_order}")
+        # A position without a stop is not allowed to stay open: remove the exit order
+        # (if one was placed) and close the position at market.
+        cancel_algo_order(symbol, target_order.get("algoId"))
+        close_result = close_symbol_position(symbol)
+        if close_result and "orderId" in close_result:
+            send_telegram_message(
+                f"🛑 {symbol}: the stop-loss could not be placed, so the position was closed automatically "
+                f"at market. No trade is open. Detail: {stop_order}")
+        else:
+            send_telegram_message(
+                f"🚨 {symbol}: stop-loss FAILED and the automatic close ALSO FAILED. Close this position "
+                f"on Binance NOW. Stop detail: {stop_order} | Close detail: {close_result}")
+        return jsonify({"status": "error", "detail": "stop-loss failed; position closed or needs manual close",
+                        "stop": stop_order}), 500
     if "algoId" not in target_order:
         send_telegram_message(f"⚠️ Exit order (target/trailing) FAILED for {symbol}. Detail: {target_order}")
     if strategy in config.TRAILING_ELIGIBLE_STRATEGIES and exit_mode == "fixed":
@@ -631,9 +687,11 @@ def webhook():
         trade_row_number = journal_result.get("rowWritten")
         stop_algo_id = stop_order.get("algoId")
         target_algo_id = target_order.get("algoId")
-        if trade_row_number and stop_algo_id and target_algo_id:
+        if trade_row_number and stop_algo_id:
+            # Register even if the exit order failed: the stop still protects the trade
+            # and the monitor still needs to enforce the 48 hour limit on it.
             add_open_trade(trade_row_number, symbol, side, quantity, stop, target,
-                            stop_algo_id, target_algo_id, strategy)
+                            stop_algo_id, target_algo_id or "", strategy)
         else:
             print("[WARNING] Could not register trade for monitoring — missing row number or algo IDs")
 
