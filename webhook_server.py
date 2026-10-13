@@ -74,10 +74,16 @@ def binance_delete(endpoint, params=None):
 
 
 def cancel_algo_order(symbol, algo_id):
-    """Best effort cancel of a conditional (algo) order; never raises."""
+    """
+    Best effort cancel of a protective order; never raises.
+    Conditional (algo) orders are cancelled through /fapi/v1/algoOrder. A plain limit
+    take-profit is stored as "L:<orderId>" and is cancelled through /fapi/v1/order.
+    """
     if not algo_id:
         return None
     try:
+        if str(algo_id).startswith("L:"):
+            return binance_delete("/fapi/v1/order", {"symbol": symbol, "orderId": str(algo_id)[2:]})
         return binance_delete("/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
     except Exception as e:
         print(f"[WARNING] Could not cancel algo order {algo_id} on {symbol}: {e}")
@@ -234,6 +240,33 @@ def place_market_order(symbol, side, quantity):
     })
 
 
+def get_fill_price(symbol, order_id, fallback_price=None):
+    """
+    Real average fill price of a market order. Binance's immediate reply to a market
+    order often reports avgPrice as 0, so the order is looked up again (a few short
+    retries), then the position's entry price is tried. Returns (price, source) where
+    source is "fill", "position" or "signal" (signal = could not read a real fill).
+    """
+    for _ in range(4):
+        try:
+            order = binance_get("/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+            avg = float(order.get("avgPrice", 0) or 0)
+            if avg > 0:
+                return avg, "fill"
+        except Exception as e:
+            print(f"[FILL PRICE] order lookup failed for {symbol}: {e}")
+        time.sleep(0.5)
+    try:
+        positions = binance_get("/fapi/v2/positionRisk", {"symbol": symbol})
+        if positions and float(positions[0].get("positionAmt", 0)) != 0:
+            price = float(positions[0].get("entryPrice", 0) or 0)
+            if price > 0:
+                return price, "position"
+    except Exception as e:
+        print(f"[FILL PRICE] position lookup failed for {symbol}: {e}")
+    return fallback_price, "signal"
+
+
 def get_atr(symbol, period=14):
     """Recent 1H ATR, used to size the trailing-stop callback rate."""
     klines = requests.get(
@@ -257,6 +290,21 @@ def calc_callback_rate(symbol, entry):
     return min(10.0, max(0.1, round(rate, 1)))
 
 
+def place_algo_on_mark_price(params):
+    """
+    Places a conditional order that triggers on Binance's MARK price, which ignores the
+    single bad price prints ("wicks") that the last-price trigger reacts to. If Binance
+    rejects the mark-price setting, the same order is retried on last price so the trade is
+    never left unprotected. Returns (response, basis) where basis is "mark" or "last".
+    """
+    result = binance_post("/fapi/v1/algoOrder", {**params, "workingType": "MARK_PRICE"})
+    if "algoId" in result:
+        return result, "mark"
+    print(f"[WARNING] Mark-price trigger rejected: {result} -- retrying on last price")
+    result = binance_post("/fapi/v1/algoOrder", dict(params))
+    return result, "last"
+
+
 def place_protective_orders(symbol, side, quantity, stop_price, target_price, strategy=None, entry=None):
     """
     IMPORTANT: As of Dec 9, 2025, Binance requires all conditional orders
@@ -267,20 +315,26 @@ def place_protective_orders(symbol, side, quantity, stop_price, target_price, st
     the trigger price parameter is called "triggerPrice", not "stopPrice".
 
     Exit style depends on the strategy:
+      - Stop loss (all strategies): STOP_MARKET triggered on MARK price. It always
+        gets the trade out, and a single bad price print cannot set it off.
       - Zone / Momentum (config.TRAILING_ELIGIBLE_STRATEGIES): no fixed
-        take-profit. A TRAILING_STOP_MARKET order is placed that stays
+        take-profit. A TRAILING_STOP_MARKET order (also on MARK price) stays
         dormant until price reaches the 3:1 level (target_price), then
         trails by callbackRate % behind price.
-      - Everything else (Mean Reversion): fixed TAKE_PROFIT_MARKET.
-    If the trailing order is rejected, falls back to a fixed take-profit so
-    the trade is never left without a target.
+      - Mean Reversion: a plain reduce-only LIMIT order at the target. A limit order
+        can only fill at the target price or better, never at a worse price.
+    If the trailing order or the limit order is rejected, it falls back to a
+    take-profit market order on mark price so the trade is never left without a target.
 
-    Returns (stop_order, target_order, mode, callback_rate) where mode is
-    "trailing" or "fixed".
+    Returns (stop_order, target_order, mode, callback_rate, trigger_basis) where
+    mode is "trailing", "limit" or "fixed", and trigger_basis is "mark" or "last"
+    (what the stop actually triggers on). A limit target is returned as
+    {"algoId": "L:<orderId>"}; the "L:" prefix tells the monitor to cancel it as a
+    normal order.
     """
     opposite_side = "SELL" if side == "BUY" else "BUY"
 
-    stop_order = binance_post("/fapi/v1/algoOrder", {
+    stop_order, basis = place_algo_on_mark_price({
         "algoType": "CONDITIONAL",
         "symbol": symbol,
         "side": opposite_side,
@@ -297,7 +351,7 @@ def place_protective_orders(symbol, side, quantity, stop_price, target_price, st
     if strategy in config.TRAILING_ELIGIBLE_STRATEGIES:
         try:
             callback_rate = calc_callback_rate(symbol, entry if entry else float(target_price))
-            target_order = binance_post("/fapi/v1/algoOrder", {
+            target_order, _ = place_algo_on_mark_price({
                 "algoType": "CONDITIONAL",
                 "symbol": symbol,
                 "side": opposite_side,
@@ -315,9 +369,27 @@ def place_protective_orders(symbol, side, quantity, stop_price, target_price, st
         except Exception as e:
             print(f"[WARNING] Trailing order failed for {symbol}: {e} -- falling back to fixed take-profit")
             target_order = None
+    else:
+        try:
+            limit_order = binance_post("/fapi/v1/order", {
+                "symbol": symbol,
+                "side": opposite_side,
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "quantity": quantity,
+                "price": target_price,
+                "reduceOnly": "true",
+            })
+            if "orderId" in limit_order:
+                target_order = {"algoId": f"L:{limit_order['orderId']}", "limitOrder": limit_order}
+                mode = "limit"
+            else:
+                print(f"[WARNING] Limit take-profit rejected for {symbol}: {limit_order} -- falling back to take-profit market")
+        except Exception as e:
+            print(f"[WARNING] Limit take-profit failed for {symbol}: {e} -- falling back to take-profit market")
 
     if target_order is None:
-        target_order = binance_post("/fapi/v1/algoOrder", {
+        target_order, _ = place_algo_on_mark_price({
             "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": opposite_side,
@@ -328,7 +400,7 @@ def place_protective_orders(symbol, side, quantity, stop_price, target_price, st
         })
         mode = "fixed"
 
-    return stop_order, target_order, mode, callback_rate
+    return stop_order, target_order, mode, callback_rate, basis
 
 
 # ─────────────────────────────
@@ -622,8 +694,13 @@ def webhook():
         send_telegram_message(f"❌ Order FAILED for {symbol}: {entry_order}")
         return jsonify({"status": "error", "detail": entry_order}), 500
 
+    # ── Real fill price: this is what the journal and Telegram report ──
+    signal_entry = entry
+    fill_price, fill_source = get_fill_price(symbol, entry_order["orderId"], fallback_price=signal_entry)
+    print(f"[FILL] {symbol}: signal {signal_entry} -> filled {fill_price} ({fill_source})")
+
     # ── Place protective stop-loss and take-profit ──
-    stop_order, target_order, exit_mode, callback_rate = place_protective_orders(
+    stop_order, target_order, exit_mode, callback_rate, trigger_basis = place_protective_orders(
         symbol, side, quantity_str, stop_str, target_str, strategy=strategy, entry=entry)
 
     if "algoId" not in stop_order:
@@ -645,18 +722,30 @@ def webhook():
         send_telegram_message(f"⚠️ Exit order (target/trailing) FAILED for {symbol}. Detail: {target_order}")
     if strategy in config.TRAILING_ELIGIBLE_STRATEGIES and exit_mode == "fixed":
         send_telegram_message(f"⚠️ {symbol}: trailing order was rejected, used a fixed take-profit instead.")
+    if strategy not in config.TRAILING_ELIGIBLE_STRATEGIES and exit_mode == "fixed":
+        send_telegram_message(f"⚠️ {symbol}: the limit take-profit was rejected, used a take-profit market order instead.")
 
     # ── Telegram confirmation ──
-    risk_reward = round(abs(target - entry) / per_unit_risk, 2)
+    # Risk and R:R from the REAL fill, not the signal price.
+    real_stop_distance = abs(fill_price - stop)
+    risk_amount = round(quantity * real_stop_distance, 2)
+    risk_reward = round(abs(target - fill_price) / real_stop_distance, 2) if real_stop_distance > 0 else 0
+    if fill_source == "signal":
+        entry_line = f"Entry: {fill_price} (signal price — real fill could not be read)\n"
+        fill_note = "Entry is the signal price; real fill could not be read"
+    else:
+        entry_line = f"Entry (filled): {fill_price}  | signal: {signal_entry}\n"
+        fill_note = f"Signal price {signal_entry}, filled at {fill_price}"
     send_telegram_message(
         f"✅ Trade OPENED\n"
         f"Pair: {symbol}\n"
         f"Side: {side}\n"
         f"Strategy: {strategy}\n"
-        f"Entry: {entry}\n"
+        f"{entry_line}"
         f"Stop: {stop}\n"
-        f"{'Trail activates at' if exit_mode == 'trailing' else 'Target'}: {target}\n"
-        + (f"Trail distance: {callback_rate}%\n" if exit_mode == "trailing" else "") +
+        f"{'Trail activates at' if exit_mode == 'trailing' else ('Target (limit order)' if exit_mode == 'limit' else 'Target')}: {target}\n"
+        + (f"Trail distance: {callback_rate}%\n" if exit_mode == "trailing" else "")
+        + (f"Triggers on: {'mark price' if trigger_basis == 'mark' else 'LAST price (mark price was not accepted)'}\n") +
         f"R:R: {risk_reward}:1\n"
         f"Risk: ${risk_amount}\n"
         f"Size: {quantity}"
@@ -669,7 +758,7 @@ def webhook():
         "timeframe": data.get("timeframe", "1 Hour"),
         "session": entry_time_utc,
         "strategy": strategy,
-        "entry": entry,
+        "entry": fill_price,
         "stop": stop,
         "target": target,
         "riskReward": f"{risk_reward}:1",
@@ -679,7 +768,7 @@ def webhook():
         "leverage": f"{actual_leverage}X",
         "marginMode": actual_margin,
         "setupGrade": data.get("grade", ""),
-        "note": data.get("note", ""),
+        "note": (data.get("note", "") + " | " if data.get("note") else "") + fill_note,
     })
 
     # ── Register this trade for monitoring (48hr timeout, trailing, exit detection) ──

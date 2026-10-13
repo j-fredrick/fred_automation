@@ -108,10 +108,56 @@ def cancel_algo_order(symbol, algo_id):
     if not algo_id:
         return None
     try:
+        if str(algo_id).startswith("L:"):
+            # A plain limit take-profit (Mean Reversion) is a normal order, not an algo order.
+            return binance_delete("/fapi/v1/order", {"symbol": symbol, "orderId": str(algo_id)[2:]})
         return binance_delete("/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
     except Exception as e:
         print(f"[WARNING] Could not cancel algo order {algo_id} on {symbol}: {e}")
         return None
+
+
+FIRED_ALGO_STATUSES = {"TRIGGERED", "TRIGGERING", "FINISHED"}
+
+
+def algo_order_fired(symbol, algo_id):
+    """
+    True / False if Binance says whether this protective order fired, None if unknown.
+    Handles both conditional (algo) orders and the plain limit take-profit ("L:<orderId>").
+    """
+    if not algo_id:
+        return None
+    try:
+        if str(algo_id).startswith("L:"):
+            order = binance_get("/fapi/v1/order", {"symbol": symbol, "orderId": str(algo_id)[2:]})
+            status = str(order.get("status", "")).upper()
+            if not status:
+                return None
+            return status in {"FILLED", "PARTIALLY_FILLED"}
+        order = binance_get("/fapi/v1/algoOrder", {"algoId": algo_id})
+        status = str(order.get("algoStatus", order.get("status", ""))).upper()
+        if not status:
+            return None
+        return status in FIRED_ALGO_STATUSES
+    except Exception as e:
+        print(f"[WARNING] Could not check whether order {algo_id} fired on {symbol}: {e}")
+        return None
+
+
+def detect_fired_order(trade):
+    """
+    Asks Binance which protective order closed the trade: "stop", "target", or None when
+    Binance's answer is missing or ambiguous (the caller then falls back to the exit price).
+    Must run BEFORE leftover orders are cancelled, because cancelling changes their status.
+    """
+    symbol = trade["symbol"]
+    stop_fired = algo_order_fired(symbol, trade.get("stopAlgoId"))
+    target_fired = algo_order_fired(symbol, trade.get("targetAlgoId"))
+    if stop_fired and not target_fired:
+        return "stop"
+    if target_fired and not stop_fired:
+        return "target"
+    return None
 
 
 def close_market(symbol, side, quantity):
@@ -147,7 +193,7 @@ def remove_open_trade(sheet_row):
         print(f"[WARNING] Failed to remove open trade tracking: {e}")
 
 
-def close_trade_in_journal(trade_row_number, exit_reason, actual_hold_hours, exit_price, exit_type, result, r_gained_lost):
+def close_trade_in_journal(trade_row_number, exit_reason, actual_hold_hours, exit_price, exit_type, result, r_gained_lost, exit_note=""):
     try:
         payload = {
             "secret": config.APPS_SCRIPT_SECRET,
@@ -159,6 +205,7 @@ def close_trade_in_journal(trade_row_number, exit_reason, actual_hold_hours, exi
             "exitType": exit_type,
             "result": result,
             "rGainedLost": r_gained_lost,
+            "exitNote": exit_note,
         }
         requests.post(config.APPS_SCRIPT_URL, json=payload, timeout=10)
     except Exception as e:
@@ -244,6 +291,10 @@ def finish_trade(trade, forced_reason=None):
     if fills is None:
         return False  # Binance hiccup — keep tracking and retry next cycle
 
+    # Ask Binance which protective order fired BEFORE cancelling the leftovers,
+    # because cancelling changes their status.
+    fired = detect_fired_order(trade)
+
     # Whatever protective orders are left (the one that didn't trigger) must go,
     # or they could fire on the next trade for this symbol.
     cancel_algo_order(symbol, trade.get("stopAlgoId"))
@@ -252,12 +303,25 @@ def finish_trade(trade, forced_reason=None):
     summary = summarize_fills(trade, fills)
 
     if summary:
-        reason = forced_reason or classify_exit(trade, summary)
+        note = ""
+        if forced_reason:
+            reason = forced_reason
+        elif fired == "stop":
+            reason = "Stop Loss"
+            note = f"Stop order fired (level {trade['originalStop']}), filled at {summary['avg_exit']:.6g}"
+        elif fired == "target":
+            reason = "Trailing Stop" if trade["strategy"] in config.TRAILING_ELIGIBLE_STRATEGIES else "Take Profit"
+            level = trade["originalTarget"]
+            note = f"{reason} order fired (level {level}), filled at {summary['avg_exit']:.6g}"
+        else:
+            reason = classify_exit(trade, summary)  # Binance's answer unavailable: judge by exit price
         net = round(summary["net"], 2)
-        close_trade_in_journal(trade_row_number, reason, hours_open, summary["avg_exit"], reason, net, summary["r"])
+        exit_price = round(summary["avg_exit"], 6)
+        close_trade_in_journal(trade_row_number, reason, hours_open, exit_price, reason, net, summary["r"], note)
         send_telegram_message(
             f"📘 {symbol} trade closed ({reason}).\n"
             f"Exit: {summary['avg_exit']:.6g}\n"
+            + (f"{note}\n" if note else "") +
             f"Result: ${net} ({summary['r']}R)\n"
             f"Held: {hours_open:.1f}h. Journal updated."
         )
