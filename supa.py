@@ -48,9 +48,12 @@ def _request(method, table, params=None, body=None, prefer=None):
         return False, None
     headers = {
         "apikey": key,
-        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
+    # Old-style keys are JWTs (start with "eyJ") and go in both headers. The newer
+    # "sb_secret_..." keys are not JWTs and must only be sent as the apikey.
+    if key.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {key}"
     if prefer:
         headers["Prefer"] = prefer
     try:
@@ -149,6 +152,62 @@ def set_trading_enabled(enabled, source="telegram"):
                      body={"trading_enabled": bool(enabled), "updated_by": source})
     _settings_cache["value"] = None
     return ok
+
+
+# ─────────────────────────────
+# Dashboard support: login check, generic read, settings update, banner dismiss
+# ─────────────────────────────
+
+def verify_token(token):
+    """
+    Checks a dashboard login token with Supabase Auth. Returns the user's id, or None if the
+    token is missing, expired or fake. Never raises.
+    """
+    url, key = _base()
+    if not url or not token:
+        return None
+    try:
+        response = requests.get(f"{url}/auth/v1/user",
+                                headers={"apikey": key, "Authorization": f"Bearer {token}"},
+                                timeout=TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            return None
+        return response.json().get("id")
+    except Exception as e:
+        print(f"[SUPABASE] token check error: {e}")
+        return None
+
+
+def select(table, params):
+    """Plain read. Returns a list of rows, or None if the request failed."""
+    ok, rows = _request("GET", table, params=params)
+    return rows if ok else None
+
+
+def update_settings(fields, source="dashboard"):
+    """Saves already-validated settings. Returns the updated row, or None."""
+    user_id = get_user_id()
+    if not user_id or not fields:
+        return None
+    body = dict(fields)
+    body["updated_by"] = source
+    ok, rows = _request("PATCH", "settings", params={"user_id": f"eq.{user_id}"},
+                        body=body, prefer="return=representation")
+    _settings_cache["value"] = None
+    return rows[0] if ok and rows else None
+
+
+def resolve_events(event_id=None):
+    """Dismisses one problem (by id) or every open problem. Returns how many were dismissed, or None."""
+    user_id = get_user_id()
+    if not user_id:
+        return None
+    params = {"user_id": f"eq.{user_id}", "resolved_at": "is.null"}
+    if event_id is not None:
+        params["id"] = f"eq.{int(event_id)}"
+    ok, rows = _request("PATCH", "events", params=params, body={"resolved_at": _now_iso()},
+                        prefer="return=representation")
+    return len(rows or []) if ok else None
 
 
 # ─────────────────────────────

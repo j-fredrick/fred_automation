@@ -1036,6 +1036,12 @@ def handle_telegram_command(text):
         send_telegram_message(f"Unrecognized command: {text}\nSend /help to see available commands.")
 
 
+# Dashboard API (/api/...): login-protected controls for the dashboard
+import sys
+import api_routes
+api_routes.register(app, sys.modules[__name__])
+
+
 if __name__ == "__main__":
     print("Starting FRED webhook server on port 5000...")
     app.run(host="0.0.0.0", port=5000)
