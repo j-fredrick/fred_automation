@@ -25,6 +25,7 @@ import hmac
 import hashlib
 import requests
 import config
+import supa
 
 # An exit price within this fraction of the original stop/target is treated
 # as having hit that level (covers normal slippage).
@@ -318,6 +319,10 @@ def finish_trade(trade, forced_reason=None):
         net = round(summary["net"], 2)
         exit_price = round(summary["avg_exit"], 6)
         close_trade_in_journal(trade_row_number, reason, hours_open, exit_price, reason, net, summary["r"], note)
+        supa.close_trade(trade, reason, exit_price, net, summary["r"], hours_open, note, entry_price=summary["avg_entry"])
+        if reason == "Manual / Other Close":
+            supa.log_event("info", "manage-trades", f"{symbol} closed manually or by an unrecognised exit",
+                           note or None, symbol)
         send_telegram_message(
             f"📘 {symbol} trade closed ({reason}).\n"
             f"Exit: {summary['avg_exit']:.6g}\n"
@@ -329,6 +334,9 @@ def finish_trade(trade, forced_reason=None):
     else:
         reason = forced_reason or "Closed (fills not found)"
         close_trade_in_journal(trade_row_number, reason, hours_open, "", reason, "", "")
+        supa.close_trade(trade, reason, None, None, None, hours_open, "Fills not found; check Binance")
+        supa.log_event("warning", "manage-trades", f"{symbol}: closed but fills could not be matched — check Binance and the journal",
+                       None, symbol)
         send_telegram_message(
             f"📘 {symbol} trade closed ({reason}). Could not match fills to fill in the result — "
             f"please check Binance and the journal row manually."
@@ -360,10 +368,12 @@ def check_trade(trade):
         return
 
     # ── Case 2: Time stop ──
-    if hours_open >= config.MAX_HOLD_HOURS:
+    max_hold_hours = float(supa.get_settings()["max_hold_hours"])
+    if hours_open >= max_hold_hours:
         result = close_market(symbol, side, abs(position_amt))
         if "orderId" not in result:
             send_telegram_message(f"❌ Time stop FAILED to close {symbol}: {result}")
+            supa.log_event("error", "manage-trades", f"Time stop failed to close {symbol}", result, symbol)
             print(f"[ERROR] Time stop close failed for {symbol}: {result}")
             return
         time.sleep(2)  # give Binance a moment to record the closing fill
@@ -375,8 +385,26 @@ def check_trade(trade):
     # stop-loss and the trailing / take-profit exit on its own.
 
 
+def record_equity_snapshot(open_trade_count):
+    """Balance and open profit/loss for the dashboard's equity curve. Never raises."""
+    try:
+        balances = binance_get("/fapi/v2/balance")
+        positions = binance_get("/fapi/v2/positionRisk")
+        if not isinstance(balances, list) or not isinstance(positions, list):
+            return
+        wallet = next((float(b["balance"]) for b in balances if b.get("asset") == "USDT"), None)
+        if wallet is None:
+            return
+        open_positions = [p for p in positions if float(p.get("positionAmt", 0)) != 0]
+        unrealized = sum(float(p.get("unRealizedProfit", 0)) for p in open_positions)
+        supa.snapshot_equity(wallet, unrealized, len(open_positions))
+    except Exception as e:
+        print(f"[WARNING] Could not record equity snapshot: {e}")
+
+
 def run_monitor_cycle():
     trades = get_open_trades()
+    record_equity_snapshot(len(trades))
     if not trades:
         print("No open trades to check.")
         return

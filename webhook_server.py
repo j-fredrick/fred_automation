@@ -23,6 +23,7 @@ import hashlib
 import requests
 from flask import Flask, request, jsonify
 import config
+import supa
 
 app = Flask(__name__)
 
@@ -172,17 +173,17 @@ def get_open_positions_detailed():
     return [p for p in positions if float(p["positionAmt"]) != 0]
 
 
-def ensure_leverage_and_margin(symbol):
+def ensure_leverage_and_margin(symbol, leverage=None, margin_mode=None):
     """
-    Makes sure the symbol is on the configured leverage and margin mode
-    (config.LEVERAGE / config.MARGIN_MODE) BEFORE a trade opens, fixing it
+    Makes sure the symbol is on the wanted leverage and margin mode (the live settings,
+    falling back to config.LEVERAGE / config.MARGIN_MODE) BEFORE a trade opens, fixing it
     if not (only possible while flat, which is always true here because the
     existing-position check already passed). Returns (leverage, margin_mode)
     as Binance actually reports them afterwards, or None if they still don't
     match -- in which case the caller must not open the trade.
     """
-    want_lev = int(config.LEVERAGE)
-    want_margin = "CROSSED" if str(config.MARGIN_MODE).upper().startswith("CROSS") else "ISOLATED"
+    want_lev = int(leverage if leverage is not None else config.LEVERAGE)
+    want_margin = "CROSSED" if str(margin_mode or config.MARGIN_MODE).upper().startswith("CROSS") else "ISOLATED"
 
     def read():
         info = binance_get("/fapi/v2/positionRisk", {"symbol": symbol})
@@ -490,20 +491,33 @@ def set_bot_status(new_status):
 # Validation layer — the "not blind" safety checks
 # ─────────────────────────────
 
-def validate_alert(data):
+def trading_paused(settings):
     """
-    Returns (True, None) if the alert passes all checks,
-    or (False, "reason") if it should be rejected.
+    True if new trades are paused. The switch lives in Supabase (dashboard + Telegram share it).
+    If Supabase can't be reached, the old Google Sheet switch is used instead, and if that
+    fails too the bot keeps trading, so an outage can't freeze it forever.
     """
+    if settings.get("_from_db"):
+        return not settings.get("trading_enabled", True)
+    return get_bot_status() == "OFF"
+
+
+def validate_alert(data, settings=None):
+    """
+    Returns (True, None, None) if the alert passes all checks,
+    or (False, "reason", "REASON_CODE") if it should be rejected.
+    The code is stored with the signal so the dashboard can group rejections.
+    """
+    settings = settings or supa.get_settings()
 
     # 1. Kill-switch check — if trading is paused, reject everything immediately,
     # before even checking the secret, so a paused bot never processes anything.
-    if get_bot_status() == "OFF":
-        return False, "Trading is currently PAUSED (kill-switch is OFF) — send /start in Telegram to resume"
+    if trading_paused(settings):
+        return False, "Trading is currently PAUSED — resume it from the dashboard or send /start in Telegram", "BOT_PAUSED"
 
     # 2. Secret check
     if data.get("secret") != config.WEBHOOK_SECRET:
-        return False, "Invalid webhook secret"
+        return False, "Invalid webhook secret", "BAD_SECRET"
 
     # 3. Required fields present
     # "grade" and "session" are required here (not optional) so that a
@@ -515,7 +529,7 @@ def validate_alert(data):
     required = ["symbol", "side", "entry", "stop", "target", "strategy", "grade", "session"]
     for field in required:
         if field not in data:
-            return False, f"Missing required field: {field}"
+            return False, f"Missing required field: {field}", "INVALID"
 
     symbol = data["symbol"]
     side = data["side"].upper()
@@ -523,35 +537,43 @@ def validate_alert(data):
     grade = data["grade"]
     session = data["session"]
 
-    # 4. Pair whitelist
+    # 4. Pair whitelist (hard safety list in config.py)
     if symbol not in config.ALLOWED_PAIRS:
-        return False, f"{symbol} is not in the allowed pairs whitelist"
+        return False, f"{symbol} is not in the allowed pairs whitelist", "PAIR_OFF"
+
+    # 4a. Dashboard switches: pairs and strategies can be turned off without redeploying
+    enabled_pairs = settings.get("enabled_pairs")
+    if enabled_pairs is not None and symbol not in enabled_pairs:
+        return False, f"{symbol} is switched off in settings", "PAIR_OFF"
+    enabled_strategies = settings.get("enabled_strategies")
+    if enabled_strategies is not None and strategy_name not in enabled_strategies:
+        return False, f"{strategy_name} is switched off in settings", "STRATEGY_OFF"
 
     # 4b. Pair-level grade filter (currently: ETH → A/A+ only)
     if symbol in config.PAIR_GRADE_FILTERS:
         allowed_grades = config.PAIR_GRADE_FILTERS[symbol]
         if grade not in allowed_grades:
             return False, (f"{symbol} setup graded '{grade}' — only {sorted(allowed_grades)} "
-                            f"grades are allowed for this pair")
+                            f"grades are allowed for this pair"), "GRADE_FILTER"
 
     # 5. Side must be BUY or SELL
     if side not in ["BUY", "SELL"]:
-        return False, f"Invalid side: {side}"
+        return False, f"Invalid side: {side}", "INVALID"
 
     try:
         entry = float(data["entry"])
         stop = float(data["stop"])
         target = float(data["target"])
     except (ValueError, TypeError):
-        return False, "Entry, stop, and target must be numbers"
+        return False, "Entry, stop, and target must be numbers", "INVALID"
 
     # 6. Stop/target direction logic must make sense
     if side == "BUY":
         if not (stop < entry < target):
-            return False, "For a BUY, stop must be below entry and target must be above entry"
+            return False, "For a BUY, stop must be below entry and target must be above entry", "INVALID"
     else:  # SELL
         if not (target < entry < stop):
-            return False, "For a SELL, target must be below entry and stop must be above entry"
+            return False, "For a SELL, target must be below entry and stop must be above entry", "INVALID"
 
     # 7. Price sanity — compare alert's entry price to the real current market price
     try:
@@ -559,21 +581,21 @@ def validate_alert(data):
         price_diff_percent = abs(entry - live_price) / live_price * 100
         if price_diff_percent > 2.0:  # more than 2% off from real price = suspicious
             return False, (f"Alert entry price ({entry}) is {price_diff_percent:.2f}% away "
-                            f"from live market price ({live_price}) — rejecting as stale/suspicious")
+                            f"from live market price ({live_price}) — rejecting as stale/suspicious"), "STALE_PRICE"
     except Exception as e:
-        return False, f"Could not verify live price: {e}"
+        return False, f"Could not verify live price: {e}", "OTHER"
 
     # 8. Duplicate/replay protection — reject identical alerts within 10 seconds
     alert_key = f"{symbol}_{side}_{entry}_{stop}_{target}"
     now = time.time()
     if alert_key in recent_alerts and (now - recent_alerts[alert_key]) < 10:
-        return False, "Duplicate alert received within 10 seconds — ignoring"
+        return False, "Duplicate alert received within 10 seconds — ignoring", "DUPLICATE"
     recent_alerts[alert_key] = now
 
     # 9. Existing position check
     open_positions = get_open_positions()
     if symbol in open_positions:
-        return False, f"Already have an open position on {symbol} — not stacking another"
+        return False, f"Already have an open position on {symbol} — not stacking another", "PAIR_OPEN"
 
     # 9b. Conditional tiers (Momentum-US, Reversion-Europe) — only allowed
     # to fire if the account is currently completely flat. Reuses the
@@ -583,14 +605,15 @@ def validate_alert(data):
     if (strategy_name, session) in config.CONDITIONAL_TIERS:
         if open_positions:
             return False, (f"{strategy_name} ({session}) is a conditional tier — skipped because "
-                            f"{open_positions} already has an open position")
+                            f"{open_positions} already has an open position"), "CONDITIONAL_TIER"
 
     # 10. Max concurrent trades check
-    if len(open_positions) >= config.MAX_CONCURRENT_TRADES:
-        return False, (f"Already at max concurrent trades ({config.MAX_CONCURRENT_TRADES}) — "
-                        f"rejecting new signal")
+    max_trades = int(settings.get("max_concurrent_trades", config.MAX_CONCURRENT_TRADES))
+    if len(open_positions) >= max_trades:
+        return False, (f"Already at max concurrent trades ({max_trades}) — "
+                        f"rejecting new signal"), "MAX_TRADES"
 
-    return True, None
+    return True, None, None
 
 
 # ─────────────────────────────
@@ -603,11 +626,19 @@ def webhook():
     if not data:
         return jsonify({"error": "No JSON payload received"}), 400
 
-    is_valid, reason = validate_alert(data)
-    if not is_valid:
+    settings = supa.get_settings()
+
+    def reject(reason, code):
+        """Tell Telegram, record the signal and the reason in Supabase, and answer the caller."""
         print(f"[REJECTED] {reason}")
         send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
+        if code != "BAD_SECRET":  # junk requests with a wrong secret are not real signals
+            supa.log_signal(data, "rejected", code, reason)
         return jsonify({"status": "rejected", "reason": reason}), 400
+
+    is_valid, reason, code = validate_alert(data, settings)
+    if not is_valid:
+        return reject(reason, code)
 
     symbol = data["symbol"]
     side = data["side"].upper()
@@ -616,9 +647,14 @@ def webhook():
     target = float(data["target"])
     strategy = data["strategy"]
 
+    risk_percent = float(settings["risk_percent"])
+    notional_cap = float(settings["max_position_notional_usd"])
+    leverage_setting = int(settings["leverage"])
+    margin_setting = settings["margin_mode"]
+
     # ── Position sizing based on risk % ──
     balance = get_usdt_balance()
-    risk_amount = round(balance * (config.RISK_PERCENT_PER_TRADE / 100), 2)
+    risk_amount = round(balance * (risk_percent / 100), 2)
     per_unit_risk = abs(entry - stop)
     quantity = round(risk_amount / per_unit_risk, 3)
 
@@ -632,17 +668,17 @@ def webhook():
     # the position size continuing to grow alongside it. This caps
     # ORDER SIZE only; it never blocks or rejects the trade itself.
     notional = quantity * entry
-    if notional > config.MAX_POSITION_NOTIONAL_USD:
-        capped_quantity = round(config.MAX_POSITION_NOTIONAL_USD / entry, 3)
+    if notional > notional_cap:
+        capped_quantity = round(notional_cap / entry, 3)
         print(f"[NOTIONAL CAP] {symbol}: uncapped size would be {quantity} (${notional:,.2f} notional) -- "
-              f"capped to {capped_quantity} (${config.MAX_POSITION_NOTIONAL_USD:,.2f} notional)")
+              f"capped to {capped_quantity} (${notional_cap:,.2f} notional)")
         quantity = capped_quantity
 
     # ── Never ask for more margin than the account actually has ──
     # Without this, a small account sized at 10x would need ~100% of its balance
     # as margin and Binance would reject the entry once fees are counted.
     margin_limit = getattr(config, "MARGIN_USAGE_LIMIT", 0.95)
-    max_notional_by_margin = balance * margin_limit * config.LEVERAGE
+    max_notional_by_margin = balance * margin_limit * leverage_setting
     if quantity * entry > max_notional_by_margin:
         reduced_quantity = max_notional_by_margin / entry
         print(f"[MARGIN CAP] {symbol}: size {quantity} would need more than {margin_limit:.0%} of the "
@@ -652,22 +688,18 @@ def webhook():
     # ── Round quantity / stop / target to what Binance accepts for this symbol ──
     filters = get_symbol_filters(symbol)
     if not filters:
-        reason = f"Could not load Binance precision rules for {symbol} — not opening a trade without them"
-        send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
-        return jsonify({"status": "rejected", "reason": reason}), 400
+        return reject(f"Could not load Binance precision rules for {symbol} — not opening a trade without them", "OTHER")
 
     qty_dec = round_quantity(quantity, filters["step"])
     if qty_dec < filters["min_qty"] or qty_dec <= 0:
-        reason = f"{symbol} position size {quantity} is below Binance's minimum order size ({filters['min_qty']})"
-        send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
-        return jsonify({"status": "rejected", "reason": reason}), 400
+        return reject(f"{symbol} position size {quantity} is below Binance's minimum order size ({filters['min_qty']})",
+                      "ORDER_TOO_SMALL")
 
     order_value = qty_dec * Decimal(str(entry))
     if filters["min_notional"] and order_value < filters["min_notional"]:
-        reason = (f"{symbol} order value ${order_value:.2f} is below Binance's minimum of "
-                  f"${filters['min_notional']} for this pair at the current account size — skipped")
-        send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
-        return jsonify({"status": "rejected", "reason": reason}), 400
+        return reject(f"{symbol} order value ${order_value:.2f} is below Binance's minimum of "
+                      f"${filters['min_notional']} for this pair at the current account size — skipped",
+                      "ORDER_TOO_SMALL")
 
     quantity_str = format(qty_dec, "f")
     stop_str = round_price(stop, filters["tick"])
@@ -678,13 +710,11 @@ def webhook():
     # Report the risk actually taken after margin cap and rounding, not the intended figure.
     risk_amount = round(quantity * abs(entry - stop), 2)
 
-    # ── Confirm leverage / margin mode match config (auto-fix if not) ──
-    lev_state = ensure_leverage_and_margin(symbol)
+    # ── Confirm leverage / margin mode match the settings (auto-fix if not) ──
+    lev_state = ensure_leverage_and_margin(symbol, leverage_setting, margin_setting)
     if not lev_state:
-        reason = (f"{symbol} is not on {config.LEVERAGE}x {config.MARGIN_MODE} and could not be corrected "
-                  f"— not opening a trade at the wrong leverage")
-        send_telegram_message(f"⚠️ Trade REJECTED: {reason}")
-        return jsonify({"status": "rejected", "reason": reason}), 400
+        return reject(f"{symbol} is not on {leverage_setting}x {margin_setting} and could not be corrected "
+                      f"— not opening a trade at the wrong leverage", "OTHER")
     actual_leverage, actual_margin = lev_state
 
     # ── Place the entry order ──
@@ -692,6 +722,8 @@ def webhook():
 
     if "orderId" not in entry_order:
         send_telegram_message(f"❌ Order FAILED for {symbol}: {entry_order}")
+        supa.log_signal(data, "error", "ORDER_FAILED", f"Entry order failed: {entry_order}")
+        supa.log_event("error", "webhook", f"Entry order failed on {symbol}", entry_order, symbol)
         return jsonify({"status": "error", "detail": entry_order}), 500
 
     # ── Real fill price: this is what the journal and Telegram report ──
@@ -712,18 +744,30 @@ def webhook():
             send_telegram_message(
                 f"🛑 {symbol}: the stop-loss could not be placed, so the position was closed automatically "
                 f"at market. No trade is open. Detail: {stop_order}")
+            supa.log_event("error", "webhook", f"{symbol}: stop-loss failed, position closed automatically",
+                           stop_order, symbol)
         else:
             send_telegram_message(
                 f"🚨 {symbol}: stop-loss FAILED and the automatic close ALSO FAILED. Close this position "
                 f"on Binance NOW. Stop detail: {stop_order} | Close detail: {close_result}")
+            supa.log_event("error", "webhook", f"{symbol}: stop-loss AND automatic close failed — close it on Binance now",
+                           {"stop": stop_order, "close": close_result}, symbol)
+        supa.log_signal(data, "error", "ORDER_FAILED", f"Stop-loss could not be placed: {stop_order}")
         return jsonify({"status": "error", "detail": "stop-loss failed; position closed or needs manual close",
                         "stop": stop_order}), 500
     if "algoId" not in target_order:
         send_telegram_message(f"⚠️ Exit order (target/trailing) FAILED for {symbol}. Detail: {target_order}")
+        supa.log_event("error", "webhook", f"{symbol}: exit order (target/trailing) failed — trade has a stop only",
+                       target_order, symbol)
     if strategy in config.TRAILING_ELIGIBLE_STRATEGIES and exit_mode == "fixed":
         send_telegram_message(f"⚠️ {symbol}: trailing order was rejected, used a fixed take-profit instead.")
+        supa.log_event("warning", "webhook", f"{symbol}: trailing order rejected, fixed take-profit used", None, symbol)
     if strategy not in config.TRAILING_ELIGIBLE_STRATEGIES and exit_mode == "fixed":
         send_telegram_message(f"⚠️ {symbol}: the limit take-profit was rejected, used a take-profit market order instead.")
+        supa.log_event("warning", "webhook", f"{symbol}: limit take-profit rejected, take-profit market used", None, symbol)
+    if trigger_basis != "mark":
+        supa.log_event("warning", "webhook", f"{symbol}: stop triggers on last price (mark price was not accepted)",
+                       None, symbol)
 
     # ── Telegram confirmation ──
     # Risk and R:R from the REAL fill, not the signal price.
@@ -764,25 +808,53 @@ def webhook():
         "riskReward": f"{risk_reward}:1",
         "riskAmount": risk_amount,
         "positionSize": quantity,
-        "plannedHold": "48Hrs",
+        "plannedHold": f"{settings['max_hold_hours']:g}Hrs",
         "leverage": f"{actual_leverage}X",
         "marginMode": actual_margin,
         "setupGrade": data.get("grade", ""),
         "note": (data.get("note", "") + " | " if data.get("note") else "") + fill_note,
     })
 
-    # ── Register this trade for monitoring (48hr timeout, trailing, exit detection) ──
+    trade_row_number = None
+    stop_algo_id = stop_order.get("algoId")
+    target_algo_id = target_order.get("algoId")
+
+    # ── Register this trade for monitoring (hold-time limit, exit detection) ──
     if journal_result and journal_result.get("status") == "success":
         trade_row_number = journal_result.get("rowWritten")
-        stop_algo_id = stop_order.get("algoId")
-        target_algo_id = target_order.get("algoId")
         if trade_row_number and stop_algo_id:
             # Register even if the exit order failed: the stop still protects the trade
-            # and the monitor still needs to enforce the 48 hour limit on it.
+            # and the monitor still needs to enforce the hold-time limit on it.
             add_open_trade(trade_row_number, symbol, side, quantity, stop, target,
                             stop_algo_id, target_algo_id or "", strategy)
         else:
             print("[WARNING] Could not register trade for monitoring — missing row number or algo IDs")
+    else:
+        supa.log_event("warning", "webhook", f"{symbol}: trade was NOT written to the Google Sheet journal "
+                       f"(the monitor cannot track it)", journal_result, symbol)
+
+    # ── Dashboard copy of the trade (Supabase) — a failure here never affects the trade ──
+    trade_id = supa.open_trade({
+        "journal_row": trade_row_number,
+        "symbol": symbol,
+        "side": side,
+        "strategy": strategy,
+        "grade": data.get("grade"),
+        "session": data.get("session"),
+        "signal_entry": signal_entry,
+        "entry_price": fill_price,
+        "stop_price": stop,
+        "target_price": target,
+        "quantity": quantity,
+        "risk_amount": risk_amount,
+        "risk_reward": risk_reward,
+        "leverage": actual_leverage,
+        "margin_mode": actual_margin,
+        "exit_mode": "market_tp" if exit_mode == "fixed" else exit_mode,
+        "stop_order_id": str(stop_algo_id) if stop_algo_id else None,
+        "target_order_id": str(target_algo_id) if target_algo_id else None,
+    })
+    supa.log_signal(data, "traded", None, None, trade_id)
 
     return jsonify({
         "status": "success",
@@ -820,8 +892,11 @@ def run_checks():
     try:
         with contextlib.redirect_stdout(output_buffer):
             fred_detectors.run_all_pairs_live()
+        supa.heartbeat("run-checks", "ok")
         return jsonify({"status": "success", "log": output_buffer.getvalue()}), 200
     except Exception as e:
+        supa.heartbeat("run-checks", "error", str(e))
+        supa.log_event("error", "run-checks", "Hourly signal check failed", str(e))
         return jsonify({"status": "error", "detail": str(e), "log": output_buffer.getvalue()}), 500
 
 
@@ -842,8 +917,11 @@ def manage_trades():
     try:
         with contextlib.redirect_stdout(output_buffer):
             trade_monitor.run_monitor_cycle()
+        supa.heartbeat("manage-trades", "ok")
         return jsonify({"status": "success", "log": output_buffer.getvalue()}), 200
     except Exception as e:
+        supa.heartbeat("manage-trades", "error", str(e))
+        supa.log_event("error", "manage-trades", "Trade monitor cycle failed", str(e))
         return jsonify({"status": "error", "detail": str(e), "log": output_buffer.getvalue()}), 500
 
 
@@ -878,7 +956,11 @@ def telegram_webhook():
 
 def handle_telegram_command(text):
     if text == "/stop":
-        set_bot_status("OFF")
+        saved = supa.set_trading_enabled(False, "telegram")
+        set_bot_status("OFF")  # keep the Google Sheet switch in step as a fallback
+        if not saved:
+            send_telegram_message("⚠️ Could not reach the database, so only the Google Sheet switch was set. "
+                                  "Trading will still pause, but the dashboard may not show it yet.")
         send_telegram_message(
             "🛑 Trading PAUSED.\n"
             "No new trades will open. Existing open positions are unaffected — "
@@ -887,7 +969,11 @@ def handle_telegram_command(text):
         )
 
     elif text == "/start":
-        set_bot_status("ON")
+        saved = supa.set_trading_enabled(True, "telegram")
+        set_bot_status("ON")  # keep the Google Sheet switch in step as a fallback
+        if not saved:
+            send_telegram_message("⚠️ Could not reach the database, so only the Google Sheet switch was set. "
+                                  "Trading will resume, but the dashboard may not show it yet.")
         send_telegram_message("✅ Trading RESUMED. New signals will now be processed normally.")
 
     elif text == "/positions":
